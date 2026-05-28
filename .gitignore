@@ -1,0 +1,8 @@
+node_modules/
+.agents/
+.gstack-codex-txn/
+data/
+AGENTS.md
+PLAN.md
+.env
+.DS_Store

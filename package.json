@@ -1,0 +1,14 @@
+{
+  "name": "certiman",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Certificate inventory and expiry notification manager",
+  "type": "module",
+  "scripts": {
+    "dev": "node src/server.js",
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
