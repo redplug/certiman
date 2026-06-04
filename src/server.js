@@ -38,6 +38,7 @@ const emptyState = () => ({
     username: "",
     password: "",
     from: "",
+    testTo: "",
     warningDays: 30,
     enabled: false
   },
@@ -121,6 +122,7 @@ async function loadVault(password) {
     state.categories ||= defaultCategories();
     state.notificationLog ||= [];
     state.smtp ||= emptyState().smtp;
+    state.smtp.testTo ||= "";
     return true;
   } catch {
     return false;
@@ -644,7 +646,7 @@ function settingsPage(message = "", error = "", req = null) {
           <label>포트<input name="port" type="number" value="${escapeHtml(smtp.port)}"></label>
           <label>보안 연결<select name="secure"><option value="false" ${smtp.secure ? "" : "selected"}>STARTTLS 또는 일반</option><option value="true" ${smtp.secure ? "selected" : ""}>TLS 즉시 연결</option></select></label>
           <label>보내는 주소<input name="from" value="${escapeHtml(smtp.from)}" placeholder="certiman@example.com"></label>
-          <label>테스트 수신자<input name="testTo" type="email" placeholder="admin@example.com"></label>
+          <label>테스트 수신자<input name="testTo" type="email" value="${escapeHtml(smtp.testTo || "")}" placeholder="admin@example.com"></label>
           <label>사용자명<input name="username" value="${escapeHtml(smtp.username)}" autocomplete="off"></label>
           <label>비밀번호<input name="password" type="password" autocomplete="off" placeholder="${smtp.password ? "저장된 비밀번호 유지" : ""}"></label>
           <label class="checkbox-row"><input name="clearPassword" type="checkbox" value="true"> 저장된 SMTP 비밀번호 삭제</label>
@@ -1031,6 +1033,7 @@ async function handle(req, res) {
       const body = await readBody(req);
       const nextPassword = String(body.password || "");
       const clearPassword = body.clearPassword === "true";
+      const testTo = String(body.testTo || "").trim();
       state.smtp = {
         host: String(body.host || "").trim(),
         port: Number(body.port || 587),
@@ -1038,6 +1041,7 @@ async function handle(req, res) {
         username: String(body.username || "").trim(),
         password: clearPassword ? "" : nextPassword || state.smtp.password || "",
         from: String(body.from || "").trim(),
+        testTo,
         warningDays: Number(body.warningDays || 30),
         enabled: body.enabled === "true"
       };
@@ -1056,6 +1060,7 @@ async function handle(req, res) {
         username: String(body.username || "").trim(),
         password: clearPassword ? "" : nextPassword || state.smtp.password || "",
         from: String(body.from || "").trim(),
+        testTo,
         warningDays: Number(body.warningDays || 30),
         enabled: body.enabled === "true"
       };
