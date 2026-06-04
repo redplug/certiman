@@ -18,6 +18,7 @@ const DEFAULT_PASSWORD = process.env.CERTIMAN_PASSWORD || "admin";
 const SESSION_SECRET = process.env.CERTIMAN_SESSION_SECRET || crypto.randomBytes(32).toString("hex");
 const COOKIE_NAME = "certiman_session";
 const DAY_MS = 24 * 60 * 60 * 1000;
+const NOTIFICATION_HOUR = 10;
 
 let vaultKey = null;
 let state = null;
@@ -112,6 +113,10 @@ async function loadVault(password) {
     state = loadedState;
     vaultKey = key;
     state.certificates ||= [];
+    state.certificates = state.certificates.map((cert) => ({
+      ...cert,
+      renewalComplete: cert.renewalComplete === true
+    }));
     state.usages ||= [];
     state.categories ||= defaultCategories();
     state.notificationLog ||= [];
@@ -336,6 +341,7 @@ function normalizeDate(value) {
 }
 
 function certStatus(cert) {
+  if (cert.renewalComplete) return { label: "갱신 완료", className: "ok", days: "" };
   const expires = new Date(cert.validTo).getTime();
   const days = Math.ceil((expires - Date.now()) / DAY_MS);
   if (days < 0) return { label: "Expired", className: "danger", days };
@@ -345,6 +351,12 @@ function certStatus(cert) {
 
 function usageCount(certificateId) {
   return state.usages.filter((usage) => usage.certificateId === certificateId).length;
+}
+
+function statusBadge(cert) {
+  const status = certStatus(cert);
+  const suffix = status.days === "" ? "" : ` · ${status.days}일`;
+  return `<span class="badge ${status.className}">${escapeHtml(status.label)}${escapeHtml(suffix)}</span>`;
 }
 
 function parseCertificate(pem, fallbackName) {
@@ -358,6 +370,7 @@ function parseCertificate(pem, fallbackName) {
     fingerprint256: x509.fingerprint256,
     validFrom: normalizeDate(x509.validFrom),
     validTo: normalizeDate(x509.validTo),
+    renewalComplete: false,
     pem,
     createdAt: new Date().toISOString()
   };
@@ -477,14 +490,13 @@ function stat(label, value) {
 }
 
 function certificateRow(cert, actions = false) {
-  const status = certStatus(cert);
   return `<tr>
     <td><a href="/certificates/${cert.id}">${escapeHtml(cert.name)}</a><small>${escapeHtml(cert.subject)}</small></td>
-    <td><span class="badge ${status.className}">${status.label} · ${status.days}일</span></td>
+    <td>${statusBadge(cert)}</td>
     <td>${escapeHtml(new Date(cert.validTo).toLocaleDateString("ko-KR"))}</td>
     <td>${usageCount(cert.id)}</td>
     <td>${escapeHtml(cert.issuer)}</td>
-    ${actions ? `<td><form method="post" action="/certificates/${cert.id}/delete" onsubmit="return confirm('이 인증서를 삭제할까요? 연결된 사용처도 삭제됩니다.');"><button class="danger-button">삭제</button></form></td>` : ""}
+    ${actions ? `<td>${renewalForm(cert)}</td><td><form method="post" action="/certificates/${cert.id}/delete" onsubmit="return confirm('이 인증서를 삭제할까요? 연결된 사용처도 삭제됩니다.');"><button class="danger-button">삭제</button></form></td>` : ""}
   </tr>`;
 }
 
@@ -510,7 +522,7 @@ function certificatesPage(error = "") {
       </form>
       <section class="table-section">
         <h2>등록 목록</h2>
-        <table><thead><tr><th>이름</th><th>상태</th><th>만료일</th><th>사용처</th><th>발급자</th><th>관리</th></tr></thead><tbody>${rows || emptyRow(6, "등록된 인증서가 없습니다.")}</tbody></table>
+        <table><thead><tr><th>이름</th><th>상태</th><th>만료일</th><th>사용처</th><th>발급자</th><th>갱신</th><th>관리</th></tr></thead><tbody>${rows || emptyRow(7, "등록된 인증서가 없습니다.")}</tbody></table>
       </section>
     </section>
   `, "certificates");
@@ -521,10 +533,10 @@ function certificateDetailPage(cert) {
   return layout(cert.name, `
     <header class="page-header">
       <div><h1>${escapeHtml(cert.name)}</h1><p>${escapeHtml(cert.subject)}</p></div>
-      <form method="post" action="/certificates/${cert.id}/delete" onsubmit="return confirm('이 인증서를 삭제할까요? 연결된 사용처도 삭제됩니다.');"><button class="danger-button">삭제</button></form>
+      <div class="header-actions">${renewalForm(cert)}<form method="post" action="/certificates/${cert.id}/delete" onsubmit="return confirm('이 인증서를 삭제할까요? 연결된 사용처도 삭제됩니다.');"><button class="danger-button">삭제</button></form></div>
     </header>
     <section class="details-grid">
-      ${detail("상태", `<span class="badge ${certStatus(cert).className}">${certStatus(cert).label} · ${certStatus(cert).days}일</span>`, true)}
+      ${detail("상태", statusBadge(cert), true)}
       ${detail("유효 시작", new Date(cert.validFrom).toLocaleString("ko-KR"))}
       ${detail("유효 종료", new Date(cert.validTo).toLocaleString("ko-KR"))}
       ${detail("시리얼", cert.serialNumber)}
@@ -536,6 +548,12 @@ function certificateDetailPage(cert) {
       <table><thead><tr><th>이름</th><th>카테고리</th><th>주소/식별자</th><th>담당자</th><th>인증서</th><th>관리</th></tr></thead><tbody>${rows || emptyRow(6, "연결된 사용처가 없습니다.")}</tbody></table>
     </section>
   `, "certificates");
+}
+
+function renewalForm(cert) {
+  return `<form class="checkbox-form" method="post" action="/certificates/${cert.id}/renewal">
+    <label class="checkbox-row"><input name="renewalComplete" type="checkbox" value="true" ${cert.renewalComplete ? "checked" : ""} onchange="this.form.submit()"> 갱신 완료</label>
+  </form>`;
 }
 
 function detail(label, value, raw = false) {
@@ -783,18 +801,20 @@ function encodeMime(value) {
 async function runNotifications({ force = false } = {}) {
   if (!state.smtp.enabled && !force) return [];
   const warningDays = Number(state.smtp.warningDays || 30);
+  const today = localDateKey(new Date());
   const results = [];
   for (const cert of state.certificates) {
+    if (cert.renewalComplete) continue;
     const status = certStatus(cert);
-    if (status.days > warningDays) continue;
+    if (status.days > warningDays || status.days < 0) continue;
     const usages = state.usages.filter((usage) => usage.certificateId === cert.id);
     for (const usage of usages) {
-      const recentlySent = state.notificationLog.find((log) =>
+      const sentToday = state.notificationLog.find((log) =>
         log.certificateId === cert.id &&
         log.usageId === usage.id &&
-        Date.now() - new Date(log.at).getTime() < DAY_MS
+        localDateKey(new Date(log.at)) === today
       );
-      if (recentlySent && !force) continue;
+      if (sentToday && !force) continue;
       const message = {
         to: usage.ownerEmail,
         subject: `[Certiman] 인증서 만료 알림: ${cert.name}`,
@@ -824,6 +844,34 @@ async function runNotifications({ force = false } = {}) {
   }
   await saveVault();
   return results;
+}
+
+function localDateKey(date) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0")
+  ].join("-");
+}
+
+function millisecondsUntilNextNotificationRun(now = new Date()) {
+  const next = new Date(now);
+  next.setHours(NOTIFICATION_HOUR, 0, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  return next.getTime() - now.getTime();
+}
+
+function scheduleDailyNotifications() {
+  const delay = millisecondsUntilNextNotificationRun();
+  setTimeout(async () => {
+    try {
+      if (state?.smtp?.enabled) await runNotifications();
+    } catch (error) {
+      console.error("notification error", error);
+    } finally {
+      scheduleDailyNotifications();
+    }
+  }, delay).unref();
 }
 
 function logEntry(cert, usage, result) {
@@ -900,6 +948,16 @@ async function handle(req, res) {
       const cert = state.certificates.find((item) => item.id === certMatch[1]);
       if (!cert) return send(res, 404, layout("없음", "<h1>인증서를 찾을 수 없습니다.</h1>"));
       return send(res, 200, certificateDetailPage(cert));
+    }
+    const certRenewalMatch = url.pathname.match(/^\/certificates\/([^/]+)\/renewal$/);
+    if (certRenewalMatch && req.method === "POST") {
+      const body = await readBody(req);
+      const cert = state.certificates.find((item) => item.id === certRenewalMatch[1]);
+      if (!cert) return send(res, 404, layout("없음", "<h1>인증서를 찾을 수 없습니다.</h1>"));
+      cert.renewalComplete = body.renewalComplete === "true";
+      await saveVault();
+      const referer = req.headers.referer || "/certificates";
+      return redirect(res, new URL(referer, `http://${req.headers.host}`).pathname);
     }
     const certDeleteMatch = url.pathname.match(/^\/certificates\/([^/]+)\/delete$/);
     if (certDeleteMatch && req.method === "POST") {
@@ -1080,9 +1138,7 @@ async function boot() {
       console.log("Encrypted vault is locked. Log in with the current password to unlock it.");
     }
   }
-  setInterval(() => {
-    if (state?.smtp?.enabled) runNotifications().catch((error) => console.error("notification error", error));
-  }, 60 * 60 * 1000).unref();
+  scheduleDailyNotifications();
   http.createServer(handle).listen(PORT, HOST, () => {
     console.log(`Certiman running at http://${HOST}:${PORT}`);
     console.log(`Initial password source: ${process.env.CERTIMAN_PASSWORD ? "CERTIMAN_PASSWORD" : "default admin"}`);

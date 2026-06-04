@@ -316,6 +316,17 @@ textarea {
   gap: 12px;
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.checkbox-form label {
+  margin-bottom: 0;
+  white-space: nowrap;
+}
+
 .tabs {
   display: flex;
   flex-wrap: wrap;

@@ -35,7 +35,8 @@ used, who owns each usage, and who should be notified before expiry.
 - Tabbed settings sections for security, SMTP, and usage categories.
 - Usage category add, rename, and delete management.
 - Manual notification check for expiring certificates.
-- Hourly automatic notification check while the server is running.
+- Daily 10:00 automatic notification check while the server is running.
+- Certificate renewal-complete flag to suppress expiry status and notifications.
 - AES-256-GCM encrypted data storage at rest.
 
 ## Requirements
@@ -163,10 +164,14 @@ Notification behavior:
 - A certificate is considered expiring when its remaining days are less than or
   equal to the configured warning threshold.
 - Notifications are sent to the owner email registered on each usage.
-- The server checks automatically once per hour.
+- The server checks automatically every day at 10:00 server local time.
+- Automatic notifications are sent daily from the warning threshold through the
+  certificate expiry date. Expired certificates are not mailed automatically.
 - You can also run a manual check from the dashboard.
 - The app avoids sending duplicate automatic notifications for the same
-  certificate usage within 24 hours.
+  certificate usage on the same local date.
+- Certificates marked `갱신 완료` ignore the expiry date and do not send expiry
+  notifications.
 - The saved SMTP password is not rendered back into the browser. Leaving the
   field blank keeps the existing server-side encrypted value.
 - Use the SMTP password delete checkbox when the stored password should be
