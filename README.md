@@ -176,6 +176,8 @@ Notification behavior:
   field blank keeps the existing server-side encrypted value.
 - Use the SMTP password delete checkbox when the stored password should be
   removed from the encrypted server vault.
+- The SMTP test button requires a `테스트 수신자` email address. That recipient
+  is used only for the test send and is not stored.
 
 ## Development
 
