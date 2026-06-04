@@ -11,8 +11,9 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DATA_DIR = path.join(ROOT, "data");
 const VAULT_PATH = path.join(DATA_DIR, "vault.json.enc");
+const ACCESS_CONTROL_PATH = path.join(DATA_DIR, "access-control.json");
 const PORT = Number(process.env.PORT || 3040);
-const HOST = process.env.HOST || "127.0.0.1";
+const HOST = process.env.HOST || "0.0.0.0";
 const DEFAULT_PASSWORD = process.env.CERTIMAN_PASSWORD || "admin";
 const SESSION_SECRET = process.env.CERTIMAN_SESSION_SECRET || crypto.randomBytes(32).toString("hex");
 const COOKIE_NAME = "certiman_session";
@@ -20,8 +21,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 let vaultKey = null;
 let state = null;
+let accessControl = null;
 
 const defaultCategories = () => ["웹사이트", "API", "서버", "로드밸런서", "메일", "기타"];
+const defaultAccessControl = () => ({ enabled: false, allowlist: [] });
 
 const emptyState = () => ({
   certificates: [],
@@ -71,6 +74,27 @@ function decryptJson(payload, key) {
 
 async function ensureDataDir() {
   await fs.mkdir(DATA_DIR, { recursive: true });
+}
+
+async function loadAccessControl() {
+  await ensureDataDir();
+  if (!fsSync.existsSync(ACCESS_CONTROL_PATH)) {
+    accessControl = defaultAccessControl();
+    await saveAccessControl();
+    return;
+  }
+  const loaded = JSON.parse(await fs.readFile(ACCESS_CONTROL_PATH, "utf8"));
+  accessControl = {
+    enabled: loaded.enabled === true,
+    allowlist: Array.isArray(loaded.allowlist) ? loaded.allowlist.map(String) : []
+  };
+}
+
+async function saveAccessControl() {
+  await ensureDataDir();
+  const tmp = `${ACCESS_CONTROL_PATH}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(accessControl || defaultAccessControl(), null, 2), { mode: 0o600 });
+  await fs.rename(tmp, ACCESS_CONTROL_PATH);
 }
 
 async function loadVault(password) {
@@ -139,6 +163,124 @@ function verifySession(cookie) {
   const expected = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url");
   if (sig.length !== expected.length) return false;
   return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected)) && body === "ok";
+}
+
+function getClientIp(req) {
+  if (process.env.CERTIMAN_TRUST_PROXY === "true") {
+    const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+    const realIp = String(req.headers["x-real-ip"] || "").trim();
+    return normalizeIp(forwarded || realIp || req.socket.remoteAddress || "");
+  }
+  return normalizeIp(req.socket.remoteAddress || "");
+}
+
+function normalizeIp(value) {
+  let ip = String(value || "").trim().replace(/%.+$/, "");
+  if (ip.startsWith("::ffff:") && net.isIP(ip.slice(7)) === 4) ip = ip.slice(7);
+  return ip;
+}
+
+function parseAccessControlInput(value) {
+  const allowlist = String(value || "")
+    .split(/[\s,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  for (const rule of allowlist) parseAccessRule(rule);
+  return Array.from(new Set(allowlist));
+}
+
+function parseAccessRule(rule) {
+  const [rawIp, rawPrefix, extra] = String(rule).split("/");
+  const ip = normalizeIp(rawIp);
+  if (!ip || extra !== undefined) throw new Error(`IP 규칙 형식이 올바르지 않습니다: ${rule}`);
+  const parsed = ipToBigInt(ip);
+  if (!parsed) throw new Error(`유효한 IP 주소가 아닙니다: ${rule}`);
+  const prefix = rawPrefix === undefined ? parsed.bits : Number(rawPrefix);
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > parsed.bits) {
+    throw new Error(`CIDR prefix가 올바르지 않습니다: ${rule}`);
+  }
+  return { ...parsed, prefix };
+}
+
+function ipToBigInt(ip) {
+  const version = net.isIP(ip);
+  if (version === 4) {
+    const parts = ip.split(".").map(Number);
+    if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return null;
+    return {
+      version,
+      bits: 32,
+      value: parts.reduce((acc, part) => (acc << 8n) + BigInt(part), 0n)
+    };
+  }
+  if (version === 6) {
+    const parts = expandIpv6(ip);
+    if (!parts) return null;
+    return {
+      version,
+      bits: 128,
+      value: parts.reduce((acc, part) => (acc << 16n) + BigInt(part), 0n)
+    };
+  }
+  return null;
+}
+
+function expandIpv6(ip) {
+  let value = ip.toLowerCase();
+  if (value.includes(".")) {
+    const lastColon = value.lastIndexOf(":");
+    const ipv4 = value.slice(lastColon + 1);
+    const parsed = ipToBigInt(ipv4);
+    if (!parsed || parsed.version !== 4) return null;
+    const high = Number((parsed.value >> 16n) & 0xffffn).toString(16);
+    const low = Number(parsed.value & 0xffffn).toString(16);
+    value = `${value.slice(0, lastColon)}:${high}:${low}`;
+  }
+  const halves = value.split("::");
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(":") : [];
+  const right = halves[1] ? halves[1].split(":") : [];
+  const missing = halves.length === 2 ? 8 - left.length - right.length : 0;
+  const parts = [...left, ...Array(missing).fill("0"), ...right];
+  if (parts.length !== 8) return null;
+  return parts.map((part) => {
+    if (!/^[0-9a-f]{1,4}$/.test(part)) return NaN;
+    return Number.parseInt(part, 16);
+  }).every((part) => Number.isInteger(part) && part >= 0 && part <= 0xffff)
+    ? parts.map((part) => Number.parseInt(part, 16))
+    : null;
+}
+
+function isIpAllowed(ip, config = accessControl) {
+  if (!config?.enabled) return true;
+  const client = ipToBigInt(normalizeIp(ip));
+  if (!client) return false;
+  return config.allowlist.some((rule) => {
+    const parsedRule = parseAccessRule(rule);
+    if (client.version !== parsedRule.version) return false;
+    const shift = BigInt(client.bits - parsedRule.prefix);
+    return (client.value >> shift) === (parsedRule.value >> shift);
+  });
+}
+
+function accessDeniedPage(ip) {
+  return `<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>접속 차단 · Certiman</title>
+  <link rel="stylesheet" href="/public/styles.css">
+</head>
+<body class="login-body">
+  <section class="login-panel">
+    <div class="brand large"><div class="mark">C</div><div><strong>Certiman</strong><span>Certificate Manager</span></div></div>
+    <h1>접속이 차단되었습니다.</h1>
+    <p class="error">현재 IP는 Certiman 허용 목록에 없습니다.</p>
+    <p class="muted">감지된 IP: <code>${escapeHtml(ip || "unknown")}</code></p>
+  </section>
+</body>
+</html>`;
 }
 
 function send(res, status, body, headers = {}) {
@@ -439,15 +581,18 @@ function usageRow(usage, actions = false) {
   </tr>`;
 }
 
-function settingsPage(message = "", error = "") {
+function settingsPage(message = "", error = "", req = null) {
   const smtp = state.smtp;
   const categories = state.categories || defaultCategories();
+  const acl = accessControl || defaultAccessControl();
+  const currentIp = req ? getClientIp(req) : "";
   return layout("설정", `
-    <header class="page-header"><div><h1>설정</h1><p>접근 비밀번호와 SMTP 발송 설정을 서버의 암호화 저장소에 보관합니다.</p></div></header>
+    <header class="page-header"><div><h1>설정</h1><p>접근 비밀번호, 접속 제한, SMTP 발송 설정을 관리합니다.</p></div></header>
     ${message ? `<p class="success">${escapeHtml(message)}</p>` : ""}
     ${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}
     <div class="tabs" role="tablist">
       <button type="button" class="active" data-tab-target="security">보안</button>
+      <button type="button" data-tab-target="access">접속 제한</button>
       <button type="button" data-tab-target="smtp">SMTP</button>
       <button type="button" data-tab-target="categories">사용처 카테고리</button>
     </div>
@@ -459,6 +604,18 @@ function settingsPage(message = "", error = "") {
         <label>새 비밀번호 확인<input name="confirmPassword" type="password" autocomplete="off" minlength="5" required></label>
         <button class="primary">비밀번호 변경</button>
         <p class="muted">비밀번호를 변경하면 서버 vault가 새 비밀번호로 다시 암호화됩니다.</p>
+      </form>
+    </section>
+    <section class="tab-panel" data-tab-panel="access">
+      <form class="panel" method="post" action="/settings/access-control" autocomplete="off">
+        <h2>접속 IP 제한</h2>
+        <div class="form-grid">
+          <label>상태<select name="enabled"><option value="false" ${acl.enabled ? "" : "selected"}>비활성</option><option value="true" ${acl.enabled ? "selected" : ""}>활성</option></select></label>
+          <label>현재 접속 IP<input value="${escapeHtml(currentIp || "unknown")}" readonly></label>
+        </div>
+        <label>허용 IP / CIDR 목록<textarea name="allowlist" rows="8" placeholder="예: 127.0.0.1&#10;192.168.0.0/24&#10;2001:db8::/32">${escapeHtml(acl.allowlist.join("\n"))}</textarea></label>
+        <button class="primary">접속 제한 저장</button>
+        <p class="muted">단일 IP 또는 CIDR을 줄바꿈, 공백, 쉼표로 입력할 수 있습니다. 리버스 프록시의 <code>X-Forwarded-For</code>를 신뢰하려면 서버 실행 환경에 <code>CERTIMAN_TRUST_PROXY=true</code>를 설정하세요.</p>
       </form>
     </section>
     <section class="tab-panel" data-tab-panel="smtp">
@@ -682,6 +839,7 @@ function logEntry(cert, usage, result) {
 
 async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  const clientIp = getClientIp(req);
   const authed = verifySession(req.headers.cookie);
 
   try {
@@ -690,6 +848,10 @@ async function handle(req, res) {
       res.writeHead(200, { "content-type": "text/css; charset=utf-8" });
       res.end(css);
       return;
+    }
+
+    if (!isIpAllowed(clientIp)) {
+      return send(res, 403, accessDeniedPage(clientIp));
     }
 
     if (url.pathname === "/login" && req.method === "GET") return send(res, 200, loginPage());
@@ -772,7 +934,7 @@ async function handle(req, res) {
       await saveVault();
       return redirect(res, "/usages");
     }
-    if (url.pathname === "/settings" && req.method === "GET") return send(res, 200, settingsPage());
+    if (url.pathname === "/settings" && req.method === "GET") return send(res, 200, settingsPage("", "", req));
     if (url.pathname === "/settings/password" && req.method === "POST") {
       const body = await readBody(req);
       const currentPassword = String(body.currentPassword || "");
@@ -781,9 +943,29 @@ async function handle(req, res) {
       try {
         if (nextPassword !== confirmPassword) throw new Error("새 비밀번호 확인이 일치하지 않습니다.");
         await changeVaultPassword(currentPassword, nextPassword);
-        return send(res, 200, settingsPage("비밀번호를 변경했고 저장소를 다시 암호화했습니다."));
+        return send(res, 200, settingsPage("비밀번호를 변경했고 저장소를 다시 암호화했습니다.", "", req));
       } catch (error) {
-        return send(res, 400, settingsPage("", error.message));
+        return send(res, 400, settingsPage("", error.message, req));
+      }
+    }
+    if (url.pathname === "/settings/access-control" && req.method === "POST") {
+      const body = await readBody(req);
+      try {
+        const nextAccessControl = {
+          enabled: body.enabled === "true",
+          allowlist: parseAccessControlInput(body.allowlist)
+        };
+        if (nextAccessControl.enabled && nextAccessControl.allowlist.length === 0) {
+          throw new Error("접속 제한을 활성화하려면 허용 IP 또는 CIDR을 하나 이상 입력하세요.");
+        }
+        if (nextAccessControl.enabled && !isIpAllowed(clientIp, nextAccessControl)) {
+          throw new Error(`현재 접속 IP(${clientIp})가 허용 목록에 없어 저장할 수 없습니다.`);
+        }
+        accessControl = nextAccessControl;
+        await saveAccessControl();
+        return send(res, 200, settingsPage("접속 IP 제한 설정을 저장했습니다.", "", req));
+      } catch (error) {
+        return send(res, 400, settingsPage("", error.message, req));
       }
     }
     if (url.pathname === "/settings/smtp" && req.method === "POST") {
@@ -801,7 +983,7 @@ async function handle(req, res) {
         enabled: body.enabled === "true"
       };
       await saveVault();
-      return send(res, 200, settingsPage("SMTP 설정을 저장했습니다."));
+      return send(res, 200, settingsPage("SMTP 설정을 저장했습니다.", "", req));
     }
     if (url.pathname === "/settings/smtp/test" && req.method === "POST") {
       const body = await readBody(req);
@@ -824,24 +1006,24 @@ async function handle(req, res) {
           body: "Certiman SMTP 설정 테스트 메일입니다."
         });
         await saveVault();
-        return send(res, 200, settingsPage("테스트 메일을 발송했습니다."));
+        return send(res, 200, settingsPage("테스트 메일을 발송했습니다.", "", req));
       } catch (error) {
         await saveVault();
-        return send(res, 400, settingsPage("", `테스트 실패: ${error.message}`));
+        return send(res, 400, settingsPage("", `테스트 실패: ${error.message}`, req));
       }
     }
     if (url.pathname === "/settings/categories" && req.method === "POST") {
       const body = await readBody(req);
       const name = String(body.name || "").trim();
-      if (!name) return send(res, 400, settingsPage("", "카테고리 이름을 입력하세요."));
+      if (!name) return send(res, 400, settingsPage("", "카테고리 이름을 입력하세요.", req));
       state.categories ||= defaultCategories();
       if (state.categories.some((category) => category.toLowerCase() === name.toLowerCase())) {
-        return send(res, 400, settingsPage("", "이미 등록된 카테고리입니다."));
+        return send(res, 400, settingsPage("", "이미 등록된 카테고리입니다.", req));
       }
       state.categories.push(name);
       state.categories.sort((a, b) => a.localeCompare(b, "ko"));
       await saveVault();
-      return send(res, 200, settingsPage("사용처 카테고리를 추가했습니다."));
+      return send(res, 200, settingsPage("사용처 카테고리를 추가했습니다.", "", req));
     }
     const categoryRenameMatch = url.pathname.match(/^\/settings\/categories\/([^/]+)\/rename$/);
     if (categoryRenameMatch && req.method === "POST") {
@@ -849,26 +1031,26 @@ async function handle(req, res) {
       const body = await readBody(req);
       const nextName = String(body.name || "").trim();
       state.categories ||= defaultCategories();
-      if (!state.categories.includes(oldName)) return send(res, 404, settingsPage("", "카테고리를 찾을 수 없습니다."));
-      if (!nextName) return send(res, 400, settingsPage("", "카테고리 이름을 입력하세요."));
+      if (!state.categories.includes(oldName)) return send(res, 404, settingsPage("", "카테고리를 찾을 수 없습니다.", req));
+      if (!nextName) return send(res, 400, settingsPage("", "카테고리 이름을 입력하세요.", req));
       if (nextName !== oldName && state.categories.some((category) => category.toLowerCase() === nextName.toLowerCase())) {
-        return send(res, 400, settingsPage("", "이미 등록된 카테고리입니다."));
+        return send(res, 400, settingsPage("", "이미 등록된 카테고리입니다.", req));
       }
       state.categories = state.categories.map((category) => category === oldName ? nextName : category).sort((a, b) => a.localeCompare(b, "ko"));
       state.usages = state.usages.map((usage) => usage.category === oldName ? { ...usage, category: nextName } : usage);
       await saveVault();
-      return send(res, 200, settingsPage("사용처 카테고리를 수정했습니다."));
+      return send(res, 200, settingsPage("사용처 카테고리를 수정했습니다.", "", req));
     }
     const categoryDeleteMatch = url.pathname.match(/^\/settings\/categories\/([^/]+)\/delete$/);
     if (categoryDeleteMatch && req.method === "POST") {
       const name = decodeURIComponent(categoryDeleteMatch[1]);
       state.categories ||= defaultCategories();
       if (state.usages.some((usage) => usage.category === name)) {
-        return send(res, 400, settingsPage("", "사용 중인 카테고리는 삭제할 수 없습니다."));
+        return send(res, 400, settingsPage("", "사용 중인 카테고리는 삭제할 수 없습니다.", req));
       }
       state.categories = state.categories.filter((category) => category !== name);
       await saveVault();
-      return send(res, 200, settingsPage("사용처 카테고리를 삭제했습니다."));
+      return send(res, 200, settingsPage("사용처 카테고리를 삭제했습니다.", "", req));
     }
     if (url.pathname === "/notifications/run" && req.method === "POST") {
       await runNotifications({ force: true });
@@ -878,7 +1060,8 @@ async function handle(req, res) {
       return sendJson(res, 200, {
         certificates: state.certificates.map(({ pem, ...cert }) => cert),
         usages: state.usages,
-        smtp: { ...state.smtp, password: state.smtp.password ? "********" : "" }
+        smtp: { ...state.smtp, password: state.smtp.password ? "********" : "" },
+        accessControl
       });
     }
     return send(res, 404, layout("404", "<h1>페이지를 찾을 수 없습니다.</h1>"));
@@ -890,6 +1073,7 @@ async function handle(req, res) {
 
 async function boot() {
   await ensureDataDir();
+  await loadAccessControl();
   if (fsSync.existsSync(VAULT_PATH)) {
     const loaded = await loadVault(DEFAULT_PASSWORD);
     if (!loaded) {

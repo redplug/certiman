@@ -54,7 +54,7 @@ node --version
 Clone the repository and enter the project directory:
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/redplug/certiman.git
 cd certiman
 ```
 
@@ -67,7 +67,7 @@ npm start
 Open:
 
 ```text
-http://127.0.0.1:3040
+http://<server-ip>:3040
 ```
 
 ## Login
@@ -98,15 +98,32 @@ Environment variables:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PORT` | `3040` | HTTP server port. |
-| `HOST` | `127.0.0.1` | HTTP bind address. |
+| `HOST` | `0.0.0.0` | HTTP bind address. Set `127.0.0.1` for local-only access. |
 | `CERTIMAN_PASSWORD` | `admin` | Login password and vault encryption key source. |
 | `CERTIMAN_SESSION_SECRET` | random per process | Session cookie signing secret. |
+| `CERTIMAN_TRUST_PROXY` | `false` | Use `X-Forwarded-For` / `X-Real-IP` for IP allowlist checks when running behind a trusted reverse proxy. |
 
 Example:
 
 ```bash
-HOST=127.0.0.1 PORT=3040 CERTIMAN_PASSWORD='change-me' npm start
+HOST=0.0.0.0 PORT=3040 CERTIMAN_PASSWORD='change-me' npm start
 ```
+
+## Access IP Restrictions
+
+IP restrictions can be configured from `설정` → `접속 제한`.
+
+- Single IPs and CIDR ranges are supported, such as `192.168.0.10`,
+  `192.168.0.0/24`, and `2001:db8::/32`.
+- When enabling the restriction, the current client IP must be included in the
+  allowlist. This prevents accidentally locking out the active administrator.
+- The access control file is stored separately at:
+
+```text
+data/access-control.json
+```
+
+It is loaded before login so restricted IPs are blocked before authentication.
 
 ## Data Storage
 
